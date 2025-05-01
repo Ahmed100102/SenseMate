@@ -21,7 +21,7 @@ Follow these steps to set up and run the project locally:
 
 1. **Clone the Repository**
    ```bash
-   git clone <your-repository-url>
+   git clone https://github.com/Ahmed100102/SenseMate.git
    cd sensemate-mobile
    ```
 
