@@ -1,16 +1,16 @@
 # sensemate-mobile
 
-SenseMate Mobile is a Flutter-based application designed to assist users with visual impairments by providing real-time object detection using a device's camera. The app utilizes TensorFlow Lite for on-device machine learning, text-to-speech (TTS) for audio feedback, and volume button interactions for navigation.
+SenseMate Mobile is a Flutter-based application designed to assist users with visual impairments by providing real-time object detection using a device's camera. The app utilizes Google ML Kit for on-device machine learning, text-to-speech (TTS) for audio feedback, and volume button interactions for navigation.
 
 ## Features
-- **Real-time Object Detection**: Uses the EfficientDet-Lite0 model to detect objects in the camera feed.
+- **Real-time Object Detection**: Uses Google ML Kit's object detection to identify objects in the camera feed.
 - **Text-to-Speech Feedback**: Announces detected objects and navigation instructions via TTS.
 - **Volume Button Navigation**: Press volume up to open the camera and volume down to return to the main page.
 - **Accessibility**: Designed with accessibility in mind, featuring high-contrast visuals and audio cues.
 
 ## Prerequisites
 To run the project, ensure you have the following installed:
-- [Flutter](https://flutter.dev/docs/get-started/install) (version 3.0 or higher)
+- [Flutter](https://flutter.dev/docs/get-started/install) (version 3.7 or higher)
 - [Dart](https://dart.dev/get-dart)
 - [Android Studio](https://developer.android.com/studio) or [Visual Studio Code](https://code.visualstudio.com/) with Flutter plugins
 - An Android or iOS device/emulator with camera support
@@ -33,19 +33,13 @@ Follow these steps to set up and run the project locally:
 
 3. **Add Required Assets**
    Ensure the following assets are in the `assets/` directory:
-    - `efficientdet_lite0.tflite`: TensorFlow Lite model file for object detection
-    - `labelmap.txt`: Text file containing labels for the COCO dataset
     - `logo.png`: App logo for the starting and main pages
-    - `test_image.jpg`: Optional test image for static inference testing
 
    Update the `pubspec.yaml` to include these assets:
    ```yaml
    flutter:
      assets:
-       - assets/efficientdet_lite0.tflite
-       - assets/labelmap.txt
        - assets/logo.png
-       - assets/test_image.jpg
    ```
 
 4. **Configure Permissions**
@@ -81,7 +75,7 @@ Follow these steps to set up and run the project locally:
 
 ## Project Structure
 - `lib/main.dart`: Main entry point and core application logic.
-- `assets/`: Contains the TensorFlow Lite model, label map, logo, and test image.
+- `assets/`: Contains the app logo.
 - `pubspec.yaml`: Lists dependencies and assets.
 
 ## Dependencies
@@ -90,20 +84,22 @@ The project uses the following Flutter packages:
 - `volume_controller`: For handling volume button events.
 - `permission_handler`: For requesting camera permissions.
 - `flutter_tts`: For text-to-speech functionality.
-- `tflite_flutter`: For running TensorFlow Lite models.
+- `tflite_flutter`: For running TensorFlow Lite models (not used in current implementation, but present in dependencies).
 - `image`: For image processing.
+- `google_mlkit_object_detection`: For real-time object detection.
 
 Ensure these are listed in `pubspec.yaml`:
 ```yaml
 dependencies:
   flutter:
     sdk: flutter
-  camera: ^0.10.0
-  volume_controller: ^0.1.0
-  permission_handler: ^10.0.0
-  flutter_tts: ^3.0.0
-  tflite_flutter: ^0.9.0
-  image: ^4.0.0
+  camera: ^0.10.5+9
+  volume_controller: ^3.3.3
+  permission_handler: ^11.3.1
+  flutter_tts: ^4.0.2
+  tflite_flutter: ^0.11.0
+  image: ^4.5.4
+  google_mlkit_object_detection: ^0.15.0
 ```
 
 ## How to Use
@@ -112,13 +108,11 @@ dependencies:
 3. **Open Camera**: Press the volume up button or tap the camera icon to navigate to the camera page.
 4. **Camera Page**: The camera feed starts, and the app performs real-time object detection. Detected objects are announced via TTS with their confidence scores. Bounding boxes and labels are drawn on the screen.
 5. **Return to Main Page**: Press the volume down button or tap the home icon to return to the main page. TTS announces "Returning to main page."
-6. **Test Static Image**: On the camera page, press the "Test Inference with Static Image" button to run object detection on `test_image.jpg`.
 
 ## Troubleshooting
 - **Camera Permission Denied**: Ensure camera permissions are granted in the device settings.
-- **Model Fails to Load**: Verify that `efficientdet_lite0.tflite` is correctly placed in `assets/` and listed in `pubspec.yaml`.
 - **TTS Not Working**: Check if the device has TTS engines installed (Settings > Accessibility > Text-to-Speech).
-- **No Detections**: Ensure `labelmap.txt` contains the correct labels and matches the model's output classes.
+- **No Detections**: Ensure your device supports Google ML Kit and camera functionality.
 
 ## Contributing
 To contribute:
@@ -127,3 +121,4 @@ To contribute:
 3. Commit changes (`git commit -m "Add your feature"`).
 4. Push to the branch (`git push origin feature/your-feature`).
 5. Open a pull request.
+
