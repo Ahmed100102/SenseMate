@@ -1,4 +1,4 @@
-# SenseMate Mobile
+# sensemate-mobile
 
 SenseMate Mobile is a Flutter-based application designed to assist users with visual impairments by providing real-time object detection using a device's camera. The app utilizes TensorFlow Lite for on-device machine learning, text-to-speech (TTS) for audio feedback, and volume button interactions for navigation.
 
@@ -21,7 +21,7 @@ Follow these steps to set up and run the project locally:
 
 1. **Clone the Repository**
    ```bash
-   git clone https://github.com/Ahmed100102/SenseMate.git
+   git clone https://github.com/Ahmed100102/sensemate-mobile.git
    cd sensemate-mobile
    ```
 
@@ -127,6 +127,3 @@ To contribute:
 3. Commit changes (`git commit -m "Add your feature"`).
 4. Push to the branch (`git push origin feature/your-feature`).
 5. Open a pull request.
-
-## License
-This project is licensed under the MIT License. See the `LICENSE` file for details.
