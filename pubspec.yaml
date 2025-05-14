@@ -34,7 +34,5 @@ flutter_icons:
 flutter:
   uses-material-design: true
   assets:
-    - assets/lite-model_ssd_mobilenet_v1_1_metadata_2.tflite
-    - assets/labelmap.txt
     - assets/logo.png
-    - assets/test_image.jpg # Add a test image
+
