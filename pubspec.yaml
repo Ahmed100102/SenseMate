@@ -20,6 +20,7 @@ dependencies:
   permission_handler: ^11.3.1
   flutter_tts: ^4.0.2
   cupertino_icons: ^1.0.8
+  google_mlkit_object_detection: ^0.15.0
 dev_dependencies:
   flutter_test:
     sdk: flutter
@@ -33,7 +34,7 @@ flutter_icons:
 flutter:
   uses-material-design: true
   assets:
-    - assets/efficientdet_lite0.tflite
+    - assets/lite-model_ssd_mobilenet_v1_1_metadata_2.tflite
     - assets/labelmap.txt
     - assets/logo.png
     - assets/test_image.jpg # Add a test image

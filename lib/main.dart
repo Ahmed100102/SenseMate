@@ -4,10 +4,9 @@ import 'package:volume_controller/volume_controller.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'dart:async';
-import 'package:tflite_flutter/tflite_flutter.dart';
-import 'package:image/image.dart' as img;
-import 'dart:typed_data';
-import 'package:flutter/services.dart' show rootBundle;
+import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
+import 'dart:io';
+
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -30,9 +29,7 @@ void main() async {
 class TtsService {
   final FlutterTts _tts = FlutterTts();
   bool _isInitialized = false;
-
   TtsService._();
-
   static Future<TtsService> create() async {
     final instance = TtsService._();
     await instance._initializeTts();
@@ -45,13 +42,11 @@ class TtsService {
       await _tts.setSpeechRate(0.5);
       await _tts.setVolume(1.0);
       await _tts.setPitch(1.0);
-
       final engines = await _tts.getEngines;
       if (engines == null || engines.isEmpty) {
         throw Exception('No TTS engines available on this device.');
       }
       print('Available TTS engines: $engines');
-
       _isInitialized = true;
       print('TTS initialized successfully');
     } catch (e) {
@@ -67,7 +62,6 @@ class TtsService {
         print('TTS not initialized, reinitializing...');
         await _initializeTts();
       }
-
       double currentVolume;
       try {
         currentVolume = await VolumeController.instance.getVolume();
@@ -76,7 +70,6 @@ class TtsService {
         print('Failed to get volume: $e');
         currentVolume = 0.0;
       }
-
       if (currentVolume < 0.1) {
         print('Media volume too low, setting to 0.5');
         try {
@@ -85,7 +78,6 @@ class TtsService {
           print('Failed to set volume: $e');
         }
       }
-
       await _tts.stop();
       await _tts.speak(text);
       print('TTS speaking: $text');
@@ -303,7 +295,7 @@ class _MainPageState extends State<MainPage> {
       _isNavigating = true;
     });
     print('MainPage: Speaking "Opening camera page"');
-    widget.ttsService.speak('Opening camera page').then((_) {
+    widget.ttsService.speak('').then((_) {  //Opening camera page
       Navigator.pushNamed(context, '/camera').then((_) {
         setState(() {
           _isNavigating = false;
@@ -378,11 +370,15 @@ class _MainPageState extends State<MainPage> {
                       ? _navigateToCamera
                       : () {
                     ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(content: Text('No cameras available')),
+                      const SnackBar(
+                          content: Text('No cameras available')),
                     );
                     print('MainPage: Speaking "No cameras available"');
-                    widget.ttsService.speak('No cameras available').catchError((e) {
-                      print('Failed to speak in MainPage (button press): $e');
+                    widget.ttsService
+                        .speak('No cameras available')
+                        .catchError((e) {
+                      print(
+                          'Failed to speak in MainPage (button press): $e');
                     });
                   },
                 ),
@@ -419,16 +415,13 @@ class _CameraPageState extends State<CameraPage> {
   Timer? _debounceTimer;
   bool _isNavigating = false;
   List<Map<String, dynamic>> _detections = [];
-  List<String> _labels = [];
-  Interpreter? _interpreter;
-  List<int>? _inputShape;
-  int _maxDetections = 100; // Default for EfficientDet-Lite0
-  double _scoreThreshold = 0.5; // Confidence threshold
-  bool _modelLoadedSuccessfully = false;
-  int _inputSize = 320; // EfficientDet-Lite0 input size
-  DateTime? _lastProcessedTime;
+  ObjectDetector? _objectDetector;
   bool _isProcessing = false;
-  String? _lastSpokenLabel; // Track last spoken label
+  DateTime? _lastProcessedTime;
+  String? _lastSpokenLabel;
+  double _scoreThreshold = 0.3; // Confidence threshold
+  DateTime? _lastErrorSpokenTime;
+  Timer? _captureTimer;
 
   @override
   void initState() {
@@ -439,7 +432,7 @@ class _CameraPageState extends State<CameraPage> {
         ResolutionPreset.medium,
         enableAudio: false,
       );
-      _initializeControllerFuture = _initializeCameraAndModel();
+      _initializeControllerFuture = _initializeCameraAndDetector();
     } else {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         widget.ttsService.speak('No cameras available');
@@ -447,208 +440,119 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
-  Future<void> _initializeCameraAndModel() async {
+  Future<void> _initializeCameraAndDetector() async {
     try {
       print('Initializing camera...');
       await _controller!.initialize();
       print('Camera initialized successfully');
 
-      print('Loading model and labels...');
-      await _loadModel();
-      if (_interpreter == null) {
-        print('Model loading failed, aborting initialization');
-        widget.ttsService.speak('Cannot start camera: detection model failed to load');
-        return;
-      }
-      await _loadLabels();
-      print('Model and labels loaded');
+      final options = ObjectDetectorOptions(
+        mode: DetectionMode.single,
+        classifyObjects: true,
+        multipleObjects: true,
+      );
+      _objectDetector = ObjectDetector(options: options);
+      print('Object detector initialized');
 
       if (mounted) {
         setState(() {
           _isCameraInitialized = true;
-          _modelLoadedSuccessfully = true;
         });
-        try {
-          await _controller!.startImageStream(_processCameraImage);
-          print('Image stream started successfully');
-          widget.ttsService.speak('Camera page. Press volume down to return to main page.');
-        } catch (e) {
-          print('Failed to start image stream: $e');
-          widget.ttsService.speak('Failed to start camera stream');
-        }
+        // Start periodic JPEG capture
+        _startJpegCapture();
+        widget.ttsService.speak('Camera page. Press volume down to return to main page.');
       }
     } catch (e) {
-      print('Camera or model initialization error: $e');
-      widget.ttsService.speak('Failed to initialize camera or model');
+      print('Camera or detector initialization error: $e');
+      widget.ttsService.speak('Failed to initialize camera or detector');
     }
   }
 
-  Future<void> _loadModel() async {
-    try {
-      try {
-        String modelPath = 'assets/efficientdet_lite0.tflite';
-        ByteData modelData = await DefaultAssetBundle.of(context).load(modelPath);
-        print('Model asset loaded: $modelPath, size: ${modelData.lengthInBytes} bytes');
-        if (modelData.lengthInBytes == 0) {
-          throw Exception('Model file is empty');
-        }
-      } catch (e) {
-        print('Failed to access model asset: $e');
-        widget.ttsService.speak('Failed to access detection model file');
-        _interpreter = null;
+  void _startJpegCapture() {
+    _captureTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) async {
+      if (!_isCameraInitialized || _objectDetector == null || !mounted || _isProcessing) {
+        print(
+            'Skipping JPEG capture: cameraInitialized=$_isCameraInitialized, detector=${_objectDetector != null}, processing=$_isProcessing');
         return;
       }
 
-      _interpreter = await Interpreter.fromAsset('assets/efficientdet_lite0.tflite');
-      print('Model loaded successfully');
-      _inputShape = _interpreter!.getInputTensor(0).shape;
-      print('Input shape: $_inputShape');
-      var inputTensor = _interpreter!.getInputTensor(0);
-      print('Input tensor data type: ${inputTensor.type}');
-
-      if (_inputShape != null && _inputShape!.length >= 3) {
-        _inputSize = _inputShape![2];
-        print('Model input size set to: $_inputSize x $_inputSize');
-      }
-
-      List<List<int>> outputShapes = [];
-      int i = 0;
-      while (true) {
-        try {
-          var shape = _interpreter!.getOutputTensor(i).shape;
-          outputShapes.add(shape);
-          print('Output tensor $i shape: $shape');
-          i++;
-        } catch (e) {
-          print('No more output tensors at index $i');
-          break;
-        }
-      }
-
-      if (outputShapes.length >= 2) {
-        _maxDetections = outputShapes[1][1];
-        print('Max detections set to: $_maxDetections');
-      } else {
-        print('Could not determine max detections, using default: $_maxDetections');
-      }
-    } catch (e, stackTrace) {
-      print('Failed to load model: $e');
-      print('Stack trace: $stackTrace');
-      _interpreter = null;
-      widget.ttsService.speak('Failed to load detection model');
-    }
-  }
-
-  Future<void> _loadLabels() async {
-    try {
-      String labelsFile = await rootBundle.loadString('assets/labelmap.txt');
-      _labels = labelsFile
-          .split('\n')
-          .where((label) => label.trim().isNotEmpty && label.trim() != '???')
-          .toList();
-      print('Loaded labels: ${_labels.length} labels');
-      if (_labels.length < 80) {
-        print('Warning: Label file has ${_labels.length} labels, expected 80 for COCO dataset');
-        widget.ttsService.speak('Warning: Incomplete label file loaded');
-      }
-    } catch (e) {
-      print('Failed to load labels: $e');
-      widget.ttsService.speak('Failed to load labels');
-    }
-  }
-
-  void _processCameraImage(CameraImage image) async {
-    if (!_isCameraInitialized || _interpreter == null || !mounted || !_modelLoadedSuccessfully) {
-      print('Skipping image processing: cameraInitialized=$_isCameraInitialized, interpreter=${_interpreter != null}, modelLoaded=$_modelLoadedSuccessfully');
-      return;
-    }
-
-    final now = DateTime.now();
-    if (_isProcessing || (_lastProcessedTime != null && now.difference(_lastProcessedTime!).inMilliseconds < 1000)) {
-      return;
-    }
-    _isProcessing = true;
-    _lastProcessedTime = now;
-
-    try {
-      print('Processing camera image at $now');
-      img.Image? rgbImage = _convertCameraImageToImage(image);
-      if (rgbImage == null) {
-        print('Failed to convert camera image');
-        _isProcessing = false;
+      final now = DateTime.now();
+      if (_lastProcessedTime != null &&
+          now.difference(_lastProcessedTime!).inMilliseconds < 500) {
         return;
       }
 
-      img.Image? resized = img.copyResize(rgbImage, width: _inputSize, height: _inputSize);
-      rgbImage = null;
-      var input = _imageToByteList(resized);
-      resized = null;
-
-      print('Input tensor shape: [1, $_inputSize, $_inputSize, 3], length: ${input.length}, type: Uint8List');
-
-      var outputBoxes = List.filled(1 * _maxDetections * 4, 0.0).reshape([1, _maxDetections, 4]);
-      var outputClasses = List.filled(1 * _maxDetections, 0.0).reshape([1, _maxDetections]);
-      var outputScores = List.filled(1 * _maxDetections, 0.0).reshape([1, _maxDetections]);
-      var outputNum = List.filled(1, 0.0).reshape([1]);
+      _isProcessing = true;
+      _lastProcessedTime = now;
 
       try {
-        _interpreter!.runForMultipleInputs(
-          [input.reshape([1, _inputSize, _inputSize, 3])],
-          {
-            0: outputBoxes,
-            1: outputClasses,
-            2: outputScores,
-            3: outputNum,
-          },
-        );
-        print('Inference completed successfully');
+        print('Capturing JPEG at $now');
+        final XFile picture = await _controller!.takePicture();
+        final inputImage = InputImage.fromFilePath(picture.path);
+        await _processJpegImage(inputImage, picture);
       } catch (e) {
-        print('Inference error: $e');
-        widget.ttsService.speak('Error processing camera image');
+        print('JPEG capture or processing error: $e');
+        final now = DateTime.now();
+        if (_lastErrorSpokenTime == null ||
+            now.difference(_lastErrorSpokenTime!).inSeconds >= 5) {
+          widget.ttsService.speak('Error capturing or processing image');
+          _lastErrorSpokenTime = now;
+        }
+      } finally {
         _isProcessing = false;
-        return;
       }
+    });
+  }
 
-      int numDetections = outputNum[0].toInt();
-      print('Number of detections: $numDetections');
+  Future<void> _processJpegImage(InputImage inputImage, XFile picture) async {
+    try {
+      final detectedObjects = await _objectDetector!.processImage(inputImage);
+      print('Detected ${detectedObjects.length} objects');
+
+      final imageWidth = _controller!.value.previewSize!.width;
+      final imageHeight = _controller!.value.previewSize!.height;
+
       List<Map<String, dynamic>> detections = [];
       Map<String, dynamic>? highestConfidenceDetection;
 
-      for (int i = 0; i < numDetections && i < _maxDetections; i++) {
-        double score = outputScores[0][i];
-        if (score > _scoreThreshold) {
-          int classId = outputClasses[0][i].toInt();
-          if (classId > 0 && classId <= _labels.length) {
-            var detection = {
-              'ymin': outputBoxes[0][i][0] / _inputSize,
-              'xmin': outputBoxes[0][i][1] / _inputSize,
-              'ymax': outputBoxes[0][i][2] / _inputSize,
-              'xmax': outputBoxes[0][i][3] / _inputSize,
-              'class': classId - 1,
+      for (var obj in detectedObjects) {
+        final labels = obj.labels;
+        if (labels.isNotEmpty) {
+          final topLabel = labels.first;
+          final score = topLabel.confidence;
+          if (score >= _scoreThreshold) {
+            final rect = obj.boundingBox;
+            final detection = {
+              'xmin': rect.left / imageWidth,
+              'ymin': rect.top / imageHeight,
+              'xmax': rect.right / imageWidth,
+              'ymax': rect.bottom / imageHeight,
+              'label': topLabel.text,
               'score': score,
             };
             detections.add(detection);
-            print('High confidence detection $i: class $classId (${_labels[classId - 1]}), score $score');
-            if (highestConfidenceDetection == null || score > highestConfidenceDetection['score']) {
+            print(
+                'Detection: ${topLabel.text}, score: $score, box: ${rect.toString()}');
+
+            if (highestConfidenceDetection == null ||
+                score > highestConfidenceDetection!['score']) {
               highestConfidenceDetection = detection;
             }
-          } else {
-            print('Invalid class ID: $classId');
           }
         }
       }
 
-      if (detections.isEmpty && numDetections > 0) {
+      if (detections.isEmpty && detectedObjects.isNotEmpty) {
         print('No detections above threshold $_scoreThreshold');
-        _lastSpokenLabel = null; // Reset if no detections
+        _lastSpokenLabel = null;
       }
 
       if (highestConfidenceDetection != null) {
-        int classIndex = highestConfidenceDetection['class'];
-        String currentLabel = _labels[classIndex];
+        String currentLabel = highestConfidenceDetection['label'];
         double score = highestConfidenceDetection['score'];
         if (currentLabel != _lastSpokenLabel) {
-          widget.ttsService.speak('$currentLabel detected with ${(score * 100).toStringAsFixed(1)} percent confidence');
+          widget.ttsService.speak(
+              '$currentLabel detected with ${(score * 100).toStringAsFixed(1)} percent confidence');
           _lastSpokenLabel = currentLabel;
         } else {
           print('Skipping TTS: Same label as last spoken ($currentLabel)');
@@ -660,183 +564,37 @@ class _CameraPageState extends State<CameraPage> {
       });
     } catch (e) {
       print('Processing error: $e');
-      widget.ttsService.speak('Error processing camera image');
+      rethrow;
     } finally {
-      _isProcessing = false;
-    }
-  }
-
-  Uint8List _imageToByteList(img.Image image) {
-    if (image.width != _inputSize || image.height != _inputSize) {
-      print('Image dimensions invalid: ${image.width}x${image.height}, expected: $_inputSize x $_inputSize');
-      throw Exception('Invalid image dimensions for model input');
-    }
-
-    var convertedBytes = Uint8List(1 * _inputSize * _inputSize * 3);
-    var buffer = Uint8List.view(convertedBytes.buffer);
-    int pixelIndex = 0;
-    for (int y = 0; y < _inputSize; y++) {
-      for (int x = 0; x < _inputSize; x++) {
-        var pixel = image.getPixel(x, y);
-        buffer[pixelIndex++] = pixel.r.toInt();
-        buffer[pixelIndex++] = pixel.g.toInt();
-        buffer[pixelIndex++] = pixel.b.toInt();
-      }
-    }
-    return convertedBytes;
-  }
-
-  img.Image? _convertCameraImageToImage(CameraImage image) {
-    try {
-      final yPlane = image.planes[0];
-      final uPlane = image.planes[1];
-      final vPlane = image.planes[2];
-      final int width = image.width;
-      final int height = image.height;
-      final int uvRowStride = image.planes[1].bytesPerRow;
-      final int uvPixelStride = image.planes[1].bytesPerPixel ?? 1;
-
-      img.Image rgbImage = img.Image(width: width, height: height, numChannels: 3);
-      for (int y = 0; y < height; y++) {
-        for (int x = 0; x < width; x++) {
-          final int yIndex = y * width + x;
-          final int uvIndex = (y ~/ 2) * uvRowStride + (x ~/ 2) * uvPixelStride;
-          final int Y = yPlane.bytes[yIndex] & 0xFF;
-          final int U = uPlane.bytes[uvIndex] & 0xFF;
-          final int V = vPlane.bytes[uvIndex] & 0xFF;
-          int R = (Y + 1.402 * (V - 128)).round().clamp(0, 255);
-          int G = (Y - 0.344136 * (U - 128) - 0.714136 * (V - 128)).round().clamp(0, 255);
-          int B = (Y + 1.772 * (U - 128)).round().clamp(0, 255);
-          rgbImage.setPixel(x, y, img.ColorRgb8(R, G, B));
-        }
-      }
-      print('RGB image dimensions: ${rgbImage.width}x${rgbImage.height}');
-      return rgbImage;
-    } catch (e) {
-      print('Error converting camera image: $e');
-      return null;
-    }
-  }
-
-  Future<void> _testInferenceWithStaticImage() async {
-    if (_interpreter == null || !mounted) {
-      print('Cannot test inference: interpreter not loaded');
-      widget.ttsService.speak('Cannot test image: detection model not loaded');
-      return;
-    }
-
-    try {
-      ByteData data = await rootBundle.load('assets/test_image.jpg');
-      Uint8List bytes = data.buffer.asUint8List();
-      img.Image? testImage = img.decodeImage(bytes);
-      if (testImage == null) {
-        print('Failed to decode test image');
-        widget.ttsService.speak('Failed to load test image');
-        return;
-      }
-
-      img.Image? resized = img.copyResize(testImage, width: _inputSize, height: _inputSize);
-      testImage = null;
-      var input = _imageToByteList(resized);
-      resized = null;
-
-      print('Test image input tensor shape: [1, $_inputSize, $_inputSize, 3], length: ${input.length}, type: Uint8List');
-
-      var outputBoxes = List.filled(1 * _maxDetections * 4, 0.0).reshape([1, _maxDetections, 4]);
-      var outputClasses = List.filled(1 * _maxDetections, 0.0).reshape([1, _maxDetections]);
-      var outputScores = List.filled(1 * _maxDetections, 0.0).reshape([1, _maxDetections]);
-      var outputNum = List.filled(1, 0.0).reshape([1]);
-
+      // Clean up the temporary JPEG file
       try {
-        _interpreter!.runForMultipleInputs(
-          [input.reshape([1, _inputSize, _inputSize, 3])],
-          {
-            0: outputBoxes,
-            1: outputClasses,
-            2: outputScores,
-            3: outputNum,
-          },
-        );
-        print('Test image inference completed successfully');
-      } catch (e) {
-        print('Test image inference error: $e');
-        widget.ttsService.speak('Error processing test image');
-        return;
-      }
-
-      int numDetections = outputNum[0].toInt();
-      print('Test image - Number of detections: $numDetections');
-      List<Map<String, dynamic>> detections = [];
-      Map<String, dynamic>? highestConfidenceDetection;
-
-      for (int i = 0; i < numDetections && i < _maxDetections; i++) {
-        double score = outputScores[0][i];
-        if (score > _scoreThreshold) {
-          int classId = outputClasses[0][i].toInt();
-          if (classId > 0 && classId <= _labels.length) {
-            print('Test image - High confidence detection $i: class $classId (${_labels[classId - 1]}), score $score');
-            var detection = {
-              'ymin': outputBoxes[0][i][0] / _inputSize,
-              'xmin': outputBoxes[0][i][1] / _inputSize,
-              'ymax': outputBoxes[0][i][2] / _inputSize,
-              'xmax': outputBoxes[0][i][3] / _inputSize,
-              'class': classId - 1,
-              'score': score,
-            };
-            detections.add(detection);
-            if (highestConfidenceDetection == null || score > highestConfidenceDetection['score']) {
-              highestConfidenceDetection = detection;
-            }
-          } else {
-            print('Test image - Invalid class ID: $classId');
-          }
+        final file = File(picture.path);
+        if (await file.exists()) {
+          await file.delete();
+          print('Temporary JPEG file deleted: ${picture.path}');
         }
+      } catch (e) {
+        print('Error deleting temporary JPEG file: $e');
       }
-
-      if (detections.isEmpty && numDetections > 0) {
-        print('Test image - No detections above threshold $_scoreThreshold');
-      }
-
-      if (highestConfidenceDetection != null) {
-        int classIndex = highestConfidenceDetection['class'];
-        String currentLabel = _labels[classIndex];
-        double score = highestConfidenceDetection['score'];
-        widget.ttsService.speak('$currentLabel detected in test image with ${(score * 100).toStringAsFixed(1)} percent confidence');
-      }
-
-      setState(() {
-        _detections = detections;
-      });
-    } catch (e) {
-      print('Test inference error: $e');
-      widget.ttsService.speak('Error processing test image');
     }
   }
 
   Future<void> _stopCamera() async {
     if (_controller != null && _controller!.value.isInitialized) {
       try {
-        if (_controller!.value.isStreamingImages) {
-          await _controller!.stopImageStream();
-          print('Image stream stopped');
-        }
+        _captureTimer?.cancel();
+        print('JPEG capture timer stopped');
       } catch (e) {
-        print('Error stopping image stream: $e');
+        print('Error stopping capture timer: $e');
       }
-      try {
-        await _controller!.setFlashMode(FlashMode.off);
-        print('Flash mode set to off');
-      } catch (e) {
-        print('Error setting flash mode: $e');
-      }
-      await Future.delayed(const Duration(milliseconds: 1000));
+
       try {
         await _controller!.dispose();
-        _controller = null;
         print('Camera controller disposed');
       } catch (e) {
         print('Error disposing camera controller: $e');
       }
+      _controller = null;
     }
   }
 
@@ -845,9 +603,12 @@ class _CameraPageState extends State<CameraPage> {
     setState(() {
       _isNavigating = true;
     });
+
     await widget.ttsService.speak('Returning to main page');
     await _stopCamera();
+    await _objectDetector?.close();
     await Future.delayed(const Duration(milliseconds: 200));
+
     if (mounted) {
       Navigator.pop(context);
     }
@@ -858,7 +619,7 @@ class _CameraPageState extends State<CameraPage> {
     print('CameraPage: dispose called');
     _debounceTimer?.cancel();
     _stopCamera();
-    _interpreter?.close();
+    _objectDetector?.close();
     super.dispose();
   }
 
@@ -875,6 +636,7 @@ class _CameraPageState extends State<CameraPage> {
         ),
       );
     }
+
     return Scaffold(
       backgroundColor: Colors.black,
       body: ValueListenableBuilder<double>(
@@ -882,7 +644,9 @@ class _CameraPageState extends State<CameraPage> {
         builder: (context, volume, child) {
           if (_debounceTimer?.isActive ?? false) return child!;
           _debounceTimer = Timer(const Duration(milliseconds: 100), () {
-            if (volume < _previousVolume - 0.05 && _isCameraInitialized && !_isNavigating) {
+            if (volume < _previousVolume - 0.05 &&
+                _isCameraInitialized &&
+                !_isNavigating) {
               _navigateBack();
             }
             _previousVolume = volume;
@@ -893,10 +657,10 @@ class _CameraPageState extends State<CameraPage> {
           future: _initializeControllerFuture,
           builder: (context, snapshot) {
             if (snapshot.connectionState == ConnectionState.done) {
-              if (snapshot.hasError || !_modelLoadedSuccessfully) {
+              if (snapshot.hasError) {
                 return const Center(
                   child: Text(
-                    'Failed to initialize camera or model',
+                    'Failed to initialize camera or detector',
                     style: TextStyle(color: Colors.white),
                   ),
                 );
@@ -908,9 +672,7 @@ class _CameraPageState extends State<CameraPage> {
                     Container(
                       width: MediaQuery.of(context).size.width,
                       height: MediaQuery.of(context).size.height * 0.7,
-                      constraints: BoxConstraints(
-                        maxHeight: 600,
-                      ),
+                      constraints: const BoxConstraints(maxHeight: 600),
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(12),
                         child: Stack(
@@ -921,7 +683,7 @@ class _CameraPageState extends State<CameraPage> {
                               child: CameraPreview(_controller!),
                             ),
                             CustomPaint(
-                              painter: BoundingBoxPainter(_detections, _labels),
+                              painter: BoundingBoxPainter(_detections),
                               size: Size.infinite,
                             ),
                           ],
@@ -939,13 +701,6 @@ class _CameraPageState extends State<CameraPage> {
                             : null,
                       ),
                     ),
-                    if (!_isNavigating)
-                      ElevatedButton(
-                        onPressed: _isCameraInitialized && _interpreter != null
-                            ? _testInferenceWithStaticImage
-                            : null,
-                        child: const Text('Test Inference with Static Image'),
-                      ),
                   ],
                 ),
               );
@@ -960,11 +715,11 @@ class _CameraPageState extends State<CameraPage> {
     );
   }
 }
+
 class BoundingBoxPainter extends CustomPainter {
   final List<Map<String, dynamic>> detections;
-  final List<String> labels;
 
-  BoundingBoxPainter(this.detections, this.labels);
+  BoundingBoxPainter(this.detections);
 
   @override
   void paint(Canvas canvas, Size size) {
@@ -976,41 +731,32 @@ class BoundingBoxPainter extends CustomPainter {
     final textStyle = TextStyle(
       color: Colors.red,
       fontSize: 16,
-      backgroundColor: Colors.black.withOpacity(0.5),
+      backgroundColor: Colors.black.withAlpha((0.5 * 255).round()),
     );
 
     for (var detection in detections) {
-      final ymin = detection['ymin'] * size.height;
       final xmin = detection['xmin'] * size.width;
-      final ymax = detection['ymax'] * size.height;
+      final ymin = detection['ymin'] * size.height;
       final xmax = detection['xmax'] * size.width;
-      final classIndex = detection['class'] as int;
+      final ymax = detection['ymax'] * size.height;
+      final label = detection['label'] as String;
       final score = detection['score'] as double;
 
-      // Draw bounding box
-      canvas.drawRect(
-        Rect.fromLTRB(xmin, ymin, xmax, ymax),
-        paint,
+      canvas.drawRect(Rect.fromLTRB(xmin, ymin, xmax, ymax), paint);
+
+      final textSpan = TextSpan(
+        text: '$label (${(score * 100).toStringAsFixed(1)}%)',
+        style: textStyle,
       );
 
-      // Draw label and score
-      if (classIndex >= 0 && classIndex < labels.length) {
-        final label = labels[classIndex];
-        final textSpan = TextSpan(
-          text: '$label (${(score * 100).toStringAsFixed(1)}%)',
-          style: textStyle,
-        );
-        final textPainter = TextPainter(
-          text: textSpan,
-          textAlign: TextAlign.left,
-          textDirection: TextDirection.ltr,
-        );
-        textPainter.layout();
-        textPainter.paint(
-          canvas,
-          Offset(xmin, ymin - textPainter.height - 4),
-        );
-      }
+      final textPainter = TextPainter(
+        text: textSpan,
+        textAlign: TextAlign.left,
+        textDirection: TextDirection.ltr,
+      );
+
+      textPainter.layout();
+      textPainter.paint(canvas, Offset(xmin, ymin - textPainter.height - 4));
     }
   }
 
