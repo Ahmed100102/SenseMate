@@ -4,9 +4,11 @@ import 'package:volume_controller/volume_controller.dart';
 import 'package:permission_handler/permission_handler.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'dart:async';
-import 'package:google_mlkit_object_detection/google_mlkit_object_detection.dart';
+import 'package:http/http.dart' as http;
+import 'package:image/image.dart' as img;
+import 'dart:convert';
 import 'dart:io';
-
+import 'package:http_parser/http_parser.dart';
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -274,6 +276,7 @@ class _MainPageState extends State<MainPage> {
   bool _isNavigating = false;
   Timer? _debounceTimer;
   double _previousVolume = 0.0;
+  bool _isInitialVolumeSet = false;
 
   @override
   void initState() {
@@ -295,7 +298,7 @@ class _MainPageState extends State<MainPage> {
       _isNavigating = true;
     });
     print('MainPage: Speaking "Opening camera page"');
-    widget.ttsService.speak('').then((_) {  //Opening camera page
+    widget.ttsService.speak('Opening camera page').then((_) {
       Navigator.pushNamed(context, '/camera').then((_) {
         setState(() {
           _isNavigating = false;
@@ -326,7 +329,13 @@ class _MainPageState extends State<MainPage> {
         builder: (context, volume, child) {
           if (_debounceTimer?.isActive ?? false) return child!;
           _debounceTimer = Timer(const Duration(milliseconds: 100), () {
-            print('MainPage: Processing volume: $volume, previous: $_previousVolume');
+            print('MainPage: Processing volume: $volume, previous: $_previousVolume, isInitial: $_isInitialVolumeSet');
+            if (!_isInitialVolumeSet) {
+              _previousVolume = volume;
+              _isInitialVolumeSet = true;
+              print('MainPage: Initial volume set to $_previousVolume');
+              return;
+            }
             if (volume > _previousVolume + 0.05 && !_isNavigating) {
               if (widget.cameras.isNotEmpty) {
                 _navigateToCamera();
@@ -365,20 +374,16 @@ class _MainPageState extends State<MainPage> {
                 label: 'Start camera',
                 child: IconButton(
                   icon: const Icon(Icons.camera_alt, color: Color(0xFFFFD700)),
-                  iconSize: 96,
+                  iconSize: 120, // Increased from 96 to 120
                   onPressed: widget.cameras.isNotEmpty
                       ? _navigateToCamera
                       : () {
                     ScaffoldMessenger.of(context).showSnackBar(
-                      const SnackBar(
-                          content: Text('No cameras available')),
+                      const SnackBar(content: Text('No cameras available')),
                     );
                     print('MainPage: Speaking "No cameras available"');
-                    widget.ttsService
-                        .speak('No cameras available')
-                        .catchError((e) {
-                      print(
-                          'Failed to speak in MainPage (button press): $e');
+                    widget.ttsService.speak('No cameras available').catchError((e) {
+                      print('Failed to speak in MainPage (button press): $e');
                     });
                   },
                 ),
@@ -415,13 +420,13 @@ class _CameraPageState extends State<CameraPage> {
   Timer? _debounceTimer;
   bool _isNavigating = false;
   List<Map<String, dynamic>> _detections = [];
-  ObjectDetector? _objectDetector;
+  String? _errorMessage;
   bool _isProcessing = false;
   DateTime? _lastProcessedTime;
-  String? _lastSpokenLabel;
-  double _scoreThreshold = 0.3; // Confidence threshold
   DateTime? _lastErrorSpokenTime;
   Timer? _captureTimer;
+  final String _serverUrl = 'http://172.174.232.66:5000/detect';
+  String? _lastSpokenLabel;
 
   @override
   void initState() {
@@ -432,7 +437,7 @@ class _CameraPageState extends State<CameraPage> {
         ResolutionPreset.medium,
         enableAudio: false,
       );
-      _initializeControllerFuture = _initializeCameraAndDetector();
+      _initializeControllerFuture = _initializeCamera();
     } else {
       WidgetsBinding.instance.addPostFrameCallback((_) {
         widget.ttsService.speak('No cameras available');
@@ -440,45 +445,34 @@ class _CameraPageState extends State<CameraPage> {
     }
   }
 
-  Future<void> _initializeCameraAndDetector() async {
+  Future<void> _initializeCamera() async {
     try {
       print('Initializing camera...');
       await _controller!.initialize();
       print('Camera initialized successfully');
 
-      final options = ObjectDetectorOptions(
-        mode: DetectionMode.single,
-        classifyObjects: true,
-        multipleObjects: true,
-      );
-      _objectDetector = ObjectDetector(options: options);
-      print('Object detector initialized');
-
       if (mounted) {
         setState(() {
           _isCameraInitialized = true;
         });
-        // Start periodic JPEG capture
         _startJpegCapture();
         widget.ttsService.speak('Camera page. Press volume down to return to main page.');
       }
     } catch (e) {
-      print('Camera or detector initialization error: $e');
-      widget.ttsService.speak('Failed to initialize camera or detector');
+      print('Camera initialization error: $e');
+      widget.ttsService.speak('Failed to initialize camera');
     }
   }
 
   void _startJpegCapture() {
     _captureTimer = Timer.periodic(const Duration(milliseconds: 500), (timer) async {
-      if (!_isCameraInitialized || _objectDetector == null || !mounted || _isProcessing) {
-        print(
-            'Skipping JPEG capture: cameraInitialized=$_isCameraInitialized, detector=${_objectDetector != null}, processing=$_isProcessing');
+      if (!_isCameraInitialized || !mounted || _isProcessing) {
+        print('Skipping JPEG capture: cameraInitialized=$_isCameraInitialized, processing=$_isProcessing');
         return;
       }
 
       final now = DateTime.now();
-      if (_lastProcessedTime != null &&
-          now.difference(_lastProcessedTime!).inMilliseconds < 500) {
+      if (_lastProcessedTime != null && now.difference(_lastProcessedTime!).inMilliseconds < 500) {
         return;
       }
 
@@ -488,85 +482,97 @@ class _CameraPageState extends State<CameraPage> {
       try {
         print('Capturing JPEG at $now');
         final XFile picture = await _controller!.takePicture();
-        final inputImage = InputImage.fromFilePath(picture.path);
-        await _processJpegImage(inputImage, picture);
+        await _processJpegImage(picture);
       } catch (e) {
         print('JPEG capture or processing error: $e');
         final now = DateTime.now();
-        if (_lastErrorSpokenTime == null ||
-            now.difference(_lastErrorSpokenTime!).inSeconds >= 5) {
+        if (_lastErrorSpokenTime == null || now.difference(_lastErrorSpokenTime!).inSeconds >= 5) {
           widget.ttsService.speak('Error capturing or processing image');
           _lastErrorSpokenTime = now;
         }
+        setState(() {
+          _errorMessage = 'Error: $e';
+        });
       } finally {
         _isProcessing = false;
       }
     });
   }
 
-  Future<void> _processJpegImage(InputImage inputImage, XFile picture) async {
+  Future<void> _processJpegImage(XFile picture) async {
     try {
-      final detectedObjects = await _objectDetector!.processImage(inputImage);
-      print('Detected ${detectedObjects.length} objects');
+      final bytes = await picture.readAsBytes();
+      img.Image? image = img.decodeImage(bytes);
+      if (image == null) {
+        throw Exception('Failed to decode image');
+      }
 
-      final imageWidth = _controller!.value.previewSize!.width;
-      final imageHeight = _controller!.value.previewSize!.height;
+      final aspectRatio = image.width / image.height;
+      int newWidth = 640;
+      int newHeight = (640 / aspectRatio).round();
+      if (newHeight > 480) {
+        newHeight = 480;
+        newWidth = (480 * aspectRatio).round();
+      }
+      image = img.copyResize(image, width: newWidth, height: newHeight);
 
-      List<Map<String, dynamic>> detections = [];
-      Map<String, dynamic>? highestConfidenceDetection;
+      final jpegBytes = img.encodeJpg(image, quality: 70);
 
-      for (var obj in detectedObjects) {
-        final labels = obj.labels;
-        if (labels.isNotEmpty) {
-          final topLabel = labels.first;
-          final score = topLabel.confidence;
-          if (score >= _scoreThreshold) {
-            final rect = obj.boundingBox;
-            final detection = {
-              'xmin': rect.left / imageWidth,
-              'ymin': rect.top / imageHeight,
-              'xmax': rect.right / imageWidth,
-              'ymax': rect.bottom / imageHeight,
-              'label': topLabel.text,
-              'score': score,
-            };
-            detections.add(detection);
-            print(
-                'Detection: ${topLabel.text}, score: $score, box: ${rect.toString()}');
+      final request = http.MultipartRequest('POST', Uri.parse(_serverUrl));
+      request.files.add(http.MultipartFile.fromBytes(
+        'image',
+        jpegBytes,
+        filename: 'frame.jpg',
+        contentType: MediaType('image', 'jpeg'),
+      ));
 
-            if (highestConfidenceDetection == null ||
-                score > highestConfidenceDetection!['score']) {
-              highestConfidenceDetection = detection;
-            }
+      final response = await request.send().timeout(const Duration(seconds: 5));
+
+      if (response.statusCode == 200) {
+        final responseData = await response.stream.bytesToString();
+        final data = jsonDecode(responseData);
+        final detections = List<Map<String, dynamic>>.from(data['detections'] ?? []);
+
+        final previewWidth = _controller!.value.previewSize!.width;
+        final previewHeight = _controller!.value.previewSize!.height;
+        final normalizedDetections = detections.map((det) {
+          final bbox = det['bbox'] as List<dynamic>;
+          if (bbox.length != 4) return det;
+          return {
+            'label': det['label'] ?? det['class'] ?? 'Unknown',
+            'bbox': [
+              bbox[0] * previewWidth,
+              bbox[1] * previewHeight,
+              bbox[2] * previewWidth,
+              bbox[3] * previewHeight,
+            ],
+          };
+        }).toList();
+
+        if (normalizedDetections.isNotEmpty) {
+          final label = normalizedDetections.first['label'];
+          if (_lastSpokenLabel == null || _lastSpokenLabel != label) {
+            widget.ttsService.speak('$label detected');
+            _lastSpokenLabel = label;
           }
-        }
-      }
-
-      if (detections.isEmpty && detectedObjects.isNotEmpty) {
-        print('No detections above threshold $_scoreThreshold');
-        _lastSpokenLabel = null;
-      }
-
-      if (highestConfidenceDetection != null) {
-        String currentLabel = highestConfidenceDetection['label'];
-        double score = highestConfidenceDetection['score'];
-        if (currentLabel != _lastSpokenLabel) {
-          widget.ttsService.speak(
-              '$currentLabel detected with ${(score * 100).toStringAsFixed(1)} percent confidence');
-          _lastSpokenLabel = currentLabel;
         } else {
-          print('Skipping TTS: Same label as last spoken ($currentLabel)');
+          _lastSpokenLabel = null;
         }
-      }
 
-      setState(() {
-        _detections = detections;
-      });
+        setState(() {
+          _detections = normalizedDetections;
+          _errorMessage = null;
+        });
+      } else {
+        throw Exception('Server error: ${response.statusCode}');
+      }
     } catch (e) {
       print('Processing error: $e');
+      setState(() {
+        _errorMessage = 'Error: $e';
+      });
       rethrow;
     } finally {
-      // Clean up the temporary JPEG file
       try {
         final file = File(picture.path);
         if (await file.exists()) {
@@ -582,6 +588,7 @@ class _CameraPageState extends State<CameraPage> {
   Future<void> _stopCamera() async {
     if (_controller != null && _controller!.value.isInitialized) {
       try {
+        await _controller!.stopImageStream(); // Stop any ongoing streams
         _captureTimer?.cancel();
         print('JPEG capture timer stopped');
       } catch (e) {
@@ -605,12 +612,9 @@ class _CameraPageState extends State<CameraPage> {
     });
 
     await widget.ttsService.speak('Returning to main page');
-    await _stopCamera();
-    await _objectDetector?.close();
-    await Future.delayed(const Duration(milliseconds: 200));
-
+    await _stopCamera(); // Ensure camera is fully stopped before navigating
     if (mounted) {
-      Navigator.pop(context);
+      Navigator.pop(context); // Pop only if still mounted
     }
   }
 
@@ -618,8 +622,7 @@ class _CameraPageState extends State<CameraPage> {
   void dispose() {
     print('CameraPage: dispose called');
     _debounceTimer?.cancel();
-    _stopCamera();
-    _objectDetector?.close();
+    _stopCamera(); // Ensure cleanup on dispose
     super.dispose();
   }
 
@@ -644,9 +647,7 @@ class _CameraPageState extends State<CameraPage> {
         builder: (context, volume, child) {
           if (_debounceTimer?.isActive ?? false) return child!;
           _debounceTimer = Timer(const Duration(milliseconds: 100), () {
-            if (volume < _previousVolume - 0.05 &&
-                _isCameraInitialized &&
-                !_isNavigating) {
+            if (volume < _previousVolume - 0.05 && _isCameraInitialized && !_isNavigating) {
               _navigateBack();
             }
             _previousVolume = volume;
@@ -657,10 +658,10 @@ class _CameraPageState extends State<CameraPage> {
           future: _initializeControllerFuture,
           builder: (context, snapshot) {
             if (snapshot.connectionState == ConnectionState.done) {
-              if (snapshot.hasError) {
+              if (snapshot.hasError || _controller == null || !_controller!.value.isInitialized) {
                 return const Center(
                   child: Text(
-                    'Failed to initialize camera or detector',
+                    'Failed to initialize camera',
                     style: TextStyle(color: Colors.white),
                   ),
                 );
@@ -675,18 +676,9 @@ class _CameraPageState extends State<CameraPage> {
                       constraints: const BoxConstraints(maxHeight: 600),
                       child: ClipRRect(
                         borderRadius: BorderRadius.circular(12),
-                        child: Stack(
-                          fit: StackFit.expand,
-                          children: [
-                            AspectRatio(
-                              aspectRatio: _controller!.value.aspectRatio,
-                              child: CameraPreview(_controller!),
-                            ),
-                            CustomPaint(
-                              painter: BoundingBoxPainter(_detections),
-                              size: Size.infinite,
-                            ),
-                          ],
+                        child: AspectRatio(
+                          aspectRatio: _controller!.value.aspectRatio,
+                          child: CameraPreview(_controller!),
                         ),
                       ),
                     ),
@@ -696,9 +688,7 @@ class _CameraPageState extends State<CameraPage> {
                       child: IconButton(
                         icon: const Icon(Icons.home, color: Color(0xFFFFD700)),
                         iconSize: 96,
-                        onPressed: _isCameraInitialized && !_isNavigating
-                            ? _navigateBack
-                            : null,
+                        onPressed: _isCameraInitialized && !_isNavigating ? _navigateBack : null,
                       ),
                     ),
                   ],
@@ -714,52 +704,4 @@ class _CameraPageState extends State<CameraPage> {
       ),
     );
   }
-}
-
-class BoundingBoxPainter extends CustomPainter {
-  final List<Map<String, dynamic>> detections;
-
-  BoundingBoxPainter(this.detections);
-
-  @override
-  void paint(Canvas canvas, Size size) {
-    final paint = Paint()
-      ..color = Colors.red
-      ..style = PaintingStyle.stroke
-      ..strokeWidth = 3.0;
-
-    final textStyle = TextStyle(
-      color: Colors.red,
-      fontSize: 16,
-      backgroundColor: Colors.black.withAlpha((0.5 * 255).round()),
-    );
-
-    for (var detection in detections) {
-      final xmin = detection['xmin'] * size.width;
-      final ymin = detection['ymin'] * size.height;
-      final xmax = detection['xmax'] * size.width;
-      final ymax = detection['ymax'] * size.height;
-      final label = detection['label'] as String;
-      final score = detection['score'] as double;
-
-      canvas.drawRect(Rect.fromLTRB(xmin, ymin, xmax, ymax), paint);
-
-      final textSpan = TextSpan(
-        text: '$label (${(score * 100).toStringAsFixed(1)}%)',
-        style: textStyle,
-      );
-
-      final textPainter = TextPainter(
-        text: textSpan,
-        textAlign: TextAlign.left,
-        textDirection: TextDirection.ltr,
-      );
-
-      textPainter.layout();
-      textPainter.paint(canvas, Offset(xmin, ymin - textPainter.height - 4));
-    }
-  }
-
-  @override
-  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
 }
